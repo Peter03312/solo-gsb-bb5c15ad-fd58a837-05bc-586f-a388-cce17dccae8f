@@ -1113,7 +1113,18 @@ class SealVehicleReading(BaseModel):
     adopted: bool = Field(
         ...,
         description="封存时该读数是否被本货物采用：同刻有自有测温时为 false"
-        "（原始读数仍随包封存）",
+        "（原始读数仍随包封存）；被生效探头故障隔离时恒为 false",
+    )
+    quarantined: bool = Field(
+        default=False,
+        description="封存时该读数是否被本车次生效探头故障覆盖而隔离"
+        "（不参与越温重建；隔离读数仍随包封存以核对隔离依据）。"
+        "旧封存包无此字段时按 false 解释",
+    )
+    covering_fault_ids: list[str] = Field(
+        default_factory=list,
+        description="封存时覆盖该读数的生效探头故障编号（多条重叠故障全部"
+        "列出，升序）；未隔离为空；旧封存包无此字段时按空列表解释",
     )
 
 
@@ -1168,7 +1179,9 @@ class EvidenceSealContent(BaseModel):
     vehicle_readings: list[SealVehicleReading] = Field(
         ...,
         description="重建该区间所用的车载读数（区间内在车适用，含有效温度/"
-        "版本/是否被同刻自有测温取代）",
+        "版本/是否被同刻自有测温取代）；封存时已被生效探头故障隔离的读数"
+        "同样随包封存（quarantined=true、covering_fault_ids 给出覆盖故障、"
+        "adopted=false），供核对隔离依据",
     )
     loading_windows: list[SealLoadingWindow] = Field(
         ..., description="重建该区间所用的当前装卸窗口及窗口版本"

@@ -110,11 +110,37 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
                 code="case_id_conflict",
             )
 
-        # 在持锁期间的最新视图上定位区间（不存在 404 / 开放 422，复用表态语义）
-        from app.stance_crud import _resolve_interval
+        # 在持锁期间的最新一致视图上定位区间并组装证据：上下文只加载一次、
+        # 重建只做一次——区间定位（含快照校验）与封存内容组装必须共用同一
+        # 份 (events, loadings, readings, effective, quarantine)，否则在两次
+        # 读取之间若有故障登记 / 撤销 / 更正提交，会得到“旧快照 + 新隔离
+        # 状态”的撕裂视图（PG 下货物行锁已串行；单次加载在读已提交下同样
+        # 消除该窗口）。
+        from app.chain import interval_id as _interval_id
+        from app.timeline import load_cargo_context
+        from app import responsibility as resp_mod
         from app import stance_crud
 
-        _, ex = _resolve_interval(db, cargo, interval_key)
+        events, loadings, readings, effective, quarantine = load_cargo_context(
+            db, cargo_id
+        )
+        chain_result, closed_map = resp_mod.rebuild(
+            cargo, events, loadings, readings, effective, quarantine
+        )
+        ex = closed_map.get(interval_key)
+        if ex is None:
+            # 标识命中当前开放区间 -> 422；否则视为区间不存在 -> 404
+            if any(_interval_id(e) == interval_key for e in chain_result.excursions):
+                raise ApiError(
+                    422,
+                    "interval_open",
+                    f"区间 {interval_key} 尚未闭合，开放区间不接受证据封存",
+                )
+            raise ApiError(
+                404,
+                "interval_not_found",
+                f"货物 {cargo_id} 不存在标识为 {interval_key} 的已闭合越温区间",
+            )
 
         # 快照校验：必须封存当前快照；快照已变即拒绝（不留记录）
         current_snapshot = sealing.resp.snapshot_id(ex)
@@ -126,13 +152,7 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
                 code="stale_snapshot",
             )
 
-        # 一致视图上组装证据（context 与定位区间时同源；同事务同锁，无并发写入）
-        from app.timeline import load_cargo_context
-        from app import responsibility as resp_mod
-
-        events, loadings, readings, effective, quarantine = load_cargo_context(
-            db, cargo_id
-        )
+        # 表态与封存内容均取自上面那一份一致视图（同事务同锁，无并发写入）
         rows = stance_crud.load_interval_stances(db, cargo_id, interval_key)
         view = resp_mod.build_interval_view(cargo_id, ex, rows)
 

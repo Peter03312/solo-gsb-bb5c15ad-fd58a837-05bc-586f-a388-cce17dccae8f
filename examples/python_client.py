@@ -765,6 +765,89 @@ def main() -> None:
         show("故障登记列表（含撤销留痕）",
              api.get(f"/trips/{ft}/probe-faults"))
 
+        # ----- 故障已登记后封存：隔离读数随包留痕，覆盖集合变化进对照 -----
+        print("\n########## 责任证据封存 × 探头故障（隔离依据留痕）##########")
+        sc, st = "COLD-SEAL-Q-PY", "TRUCK-SEAL-Q-PY"
+        api.post("/cargo", json={
+            "cargo_id": sc, "started_at": "2026-10-05T00:00:00+08:00",
+            "temp_upper_limit": "4.0", "initial_holder": "北京冷库"})
+        api.post("/trips", json={"trip_id": st, "vehicle_no": "京B-封Q"})
+        api.post(f"/trips/{st}/manifest", json={"items": [{
+            "cargo_id": sc,
+            "loaded_at": "2026-10-05T08:00:00+08:00",
+            "unloaded_at": "2026-10-05T20:00:00+08:00"}]})
+        # 故障 [09:00, 12:30) 先登记（覆盖区间内 10:30 的越温读数）
+        api.post(f"/trips/{st}/probe-faults", json={
+            "fault_id": "pf-sq-1",
+            "fault_start": "2026-10-05T09:00:00+08:00",
+            "fault_end": "2026-10-05T12:30:00+08:00",
+            "reason": "封存前已证实失准"})
+        # 10:00 自有测温越温开启区间
+        api.post("/events", json={
+            "event_id": "sq-m-open", "cargo_id": sc,
+            "occurred_at": "2026-10-05T10:00:00+08:00", "temperature": "8.0"})
+        # 10:30 车载读数越温但落在故障时段（隔离，不参与重建；仍随包封存）
+        api.post("/vehicle-readings", json={
+            "reading_id": "sq-vr-q", "trip_id": st,
+            "read_at": "2026-10-05T10:30:00+08:00", "temperature": "9.0"})
+        # 13:00 车载读数恢复（故障已于 12:30 结束）-> 闭合区间
+        api.post("/vehicle-readings", json={
+            "reading_id": "sq-vr-ok", "trip_id": st,
+            "read_at": "2026-10-05T13:00:00+08:00", "temperature": "2.0"})
+        iv = api.get(f"/cargo/{sc}/responsibilities").json()["intervals"][0]
+        show("封存（被隔离读数 sq-vr-q 仍随包保留并标注隔离依据）",
+             api.post("/evidence-seals", json={
+                 "case_id": "CASE-SEAL-Q-PY-1", "cargo_id": sc,
+                 "interval_id": iv["interval_id"],
+                 "snapshot_id": iv["snapshot_id"]}))
+        got = api.get("/evidence-seals/CASE-SEAL-Q-PY-1").json()["content"]
+        qr = next(r for r in got["vehicle_readings"]
+                  if r["reading_id"] == "sq-vr-q")
+        print("封存包内隔离读数：", {k: qr[k] for k in (
+            "temperature", "effective_temperature", "version",
+            "adopted", "quarantined", "covering_fault_ids")})
+
+        print("封存后对照（状态 unchanged；隔离读数无差异）：",
+              api.get("/evidence-seals/CASE-SEAL-Q-PY-1/diff").json()["status"])
+
+        # 重叠故障覆盖集合变化 -> 对照中 changed(covering_fault_ids)
+        api.post(f"/trips/{st}/probe-faults", json={
+            "fault_id": "pf-sq-2",
+            "fault_start": "2026-10-05T10:15:00+08:00",
+            "fault_end": "2026-10-05T10:45:00+08:00",
+            "reason": "重叠故障"})
+        d = api.get("/evidence-seals/CASE-SEAL-Q-PY-1/diff").json()
+        ch = next(x for x in d["evidence_changes"]["vehicle_readings"]
+                  if x["key"] == "sq-vr-q")
+        print("重叠故障登记后：", ch["change"], ch["fields"],
+              "当前覆盖 =", ch["current"]["covering_fault_ids"])
+        # 撤销 pf-sq-1：sq-vr-q 仍被 pf-sq-2 覆盖，继续隔离
+        api.post(f"/trips/{st}/probe-faults/revoke", json={
+            "revocation_id": "rv-sq-1", "fault_id": "pf-sq-1",
+            "expected_version": 0})
+        d = api.get("/evidence-seals/CASE-SEAL-Q-PY-1/diff").json()
+        ch = next(x for x in d["evidence_changes"]["vehicle_readings"]
+                  if x["key"] == "sq-vr-q")
+        print("撤销一条重叠故障后：仍隔离 quarantined =",
+              ch["current"]["quarantined"],
+              "覆盖 =", ch["current"]["covering_fault_ids"])
+        # 撤销最后一条覆盖故障 -> 读数按当前有效温度恢复：10:30 的 9 度点
+        # 在自有开启点之后，区间由 sq-m-open 继续到 13:00（边界不变，只改
+        # 该证据项的隔离状态）
+        api.post(f"/trips/{st}/probe-faults/revoke", json={
+            "revocation_id": "rv-sq-2", "fault_id": "pf-sq-2",
+            "expected_version": 0})
+        d = api.get("/evidence-seals/CASE-SEAL-Q-PY-1/diff").json()
+        print("撤销最后一条覆盖故障后区间状态：", d["status"])
+        ch = next(x for x in d["evidence_changes"]["vehicle_readings"]
+                  if x["key"] == "sq-vr-q")
+        print("隔离读数恢复：change =", ch["change"], "字段 =", ch["fields"])
+        sealed = api.get("/evidence-seals/CASE-SEAL-Q-PY-1").json()["content"]
+        old = next(r for r in sealed["vehicle_readings"]
+                   if r["reading_id"] == "sq-vr-q")
+        print("封存原包不改：quarantined =", old["quarantined"],
+              "covering =", old["covering_fault_ids"])
+
 
 if __name__ == "__main__":
     main()

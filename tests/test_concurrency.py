@@ -536,3 +536,101 @@ def test_concurrent_seal_and_event_write_serialize(client):
             assert got["snapshot_id"] in (snap,) or True  # 快照为某个历史一致快照
             d = client.get(f"/evidence-seals/SEAL-{i}/diff").json()
             assert d["status"] in ("changed", "unchanged")
+
+
+def test_concurrent_seal_and_probe_fault_share_consistent_view(client):
+    """封存与探头故障登记共用货物行锁（故障再按统一锁序锁车次行）：
+    并发下看到的必为一致的已提交视图。
+
+    车载读数 vr1(10:10=8) 开启区间、vr2(11:50=2) 闭合；故障时段
+    [10:05,10:20) 恰好覆盖开启读数。4 个线程用故障前快照封存（不同案件
+    编号），8 个线程并发登记同一故障。串行结果只能是：
+
+    * 封存先于故障提交：201，封存包绑定故障前快照，vr1 未隔离
+      （quarantined=false）；故障提交后其对照变为 disappeared（vr1 记
+      removed），原包不被改写；
+    * 故障先于封存提交：开启读数被隔离、区间 veh:vr1 消失，封存按
+      404 interval_not_found 拒绝且不留记录；
+    绝不可能出现封存包既绑定故障前快照又把 vr1 标成已隔离的撕裂视图。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CSF",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "4",
+            "initial_holder": "A仓",
+        },
+    )
+    client.post("/trips", json={"trip_id": "TSF", "vehicle_no": "V"})
+    client.post(
+        "/trips/TSF/manifest",
+        json={"items": [{
+            "cargo_id": "CSF",
+            "loaded_at": "2026-01-01T10:00:00+00:00",
+            "unloaded_at": "2026-01-01T12:00:00+00:00",
+        }]},
+    )
+    client.post("/vehicle-readings", json={
+        "reading_id": "vr-open", "trip_id": "TSF",
+        "read_at": "2026-01-01T10:10:00+00:00", "temperature": "8"})
+    client.post("/vehicle-readings", json={
+        "reading_id": "vr-close", "trip_id": "TSF",
+        "read_at": "2026-01-01T11:50:00+00:00", "temperature": "2"})
+    iv = client.get("/cargo/CSF/responsibilities").json()["intervals"][0]
+    assert iv["interval_id"] == "veh:vr-open"
+    snap = iv["snapshot_id"]
+
+    fault_body = {
+        "fault_id": "pf-seal-same",
+        "fault_start": "2026-01-01T10:05:00+00:00",
+        "fault_end": "2026-01-01T10:20:00+00:00",
+        "reason": "与封存并发",
+    }
+
+    def submit_seal(i):
+        return client.post(
+            "/evidence-seals",
+            json={
+                "case_id": f"SSEAL-{i}",
+                "cargo_id": "CSF",
+                "interval_id": "veh:vr-open",
+                "snapshot_id": snap,
+            },
+        ).status_code
+
+    def submit_fault(_):
+        return client.post("/trips/TSF/probe-faults", json=fault_body).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        f_seals = [pool.submit(submit_seal, i) for i in range(4)]
+        f_faults = [pool.submit(submit_fault, i) for i in range(8)]
+        seal_codes = [f.result() for f in f_seals]
+        fault_codes = [f.result() for f in f_faults]
+
+    assert fault_codes.count(201) == 1 and fault_codes.count(200) == 7
+    assert all(code in (201, 404) for code in seal_codes)
+    assert 201 in seal_codes  # 至少一笔封存先于故障成功
+
+    for i, code in enumerate(seal_codes):
+        if code != 201:
+            # 区间消失的拒绝不留记录
+            assert client.get(f"/evidence-seals/SSEAL-{i}").status_code == 404
+            continue
+        got = client.get(f"/evidence-seals/SSEAL-{i}").json()
+        assert got["snapshot_id"] == snap
+        vr_open = next(
+            x for x in got["content"]["vehicle_readings"]
+            if x["reading_id"] == "vr-open"
+        )
+        # 封存先于故障提交 -> 视图自洽：vr-open 未隔离、参与了重建
+        assert vr_open["quarantined"] is False
+        assert vr_open["adopted"] is True
+        # 故障提交后对照：区间消失，封存后才隔离的读数记 removed
+        d = client.get(f"/evidence-seals/SSEAL-{i}/diff").json()
+        assert d["status"] == "disappeared"
+        removed = next(
+            x for x in d["evidence_changes"]["vehicle_readings"]
+            if x["key"] == "vr-open"
+        )
+        assert removed["change"] == "removed"

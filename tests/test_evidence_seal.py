@@ -11,7 +11,12 @@
   （自有事件 / 车载读数 / 装卸窗口）增删变更、责任片段增删变更，区间
   重开 / 消失明确状态；晚到记录与测温 / 窗口更正不改写原包；
 * 车载区间（veh:<读数ID>）封存、被同刻自有测温取代读数的 adopted=false、
-  车载读数更正与装卸窗口更正在对照中的体现。
+  车载读数更正与装卸窗口更正在对照中的体现；
+* 探头故障已登记后封存：区间内 / 当前装卸窗口内被隔离的车载读数不再被
+  归集漏掉，随包保留原始值 / 有效温度 / 版本并标明 quarantined /
+  covering_fault_ids / adopted=false，同刻自有测温仍优先；隔离读数的
+  后续隔离状态与覆盖集合变化（重叠故障撤销一条仍隔离、撤销最后一条恢复）
+  在对照中逐项体现，封存原文 / 摘要永不改。
 """
 from fastapi.testclient import TestClient
 
@@ -595,3 +600,271 @@ def test_seal_diff_after_loading_window_correction(client):
     assert (
         win["sealed"]["origin_loaded_at"] == win["current"]["origin_loaded_at"]
     )
+
+
+# ------------------------------------------------------- 故障已登记后封存
+
+
+def _setup_quarantined_seal_scenario(client, cargo="CQ"):
+    """故障先登记、读数后补：自有测温 m0(10:30=8) 开启区间，vr2(12:30=2)
+    闭合；区间内 vr1(11:00=9) 被故障隔离，vr3(11:15=9) 被隔离且同刻有
+    自有测温 m3(11:15=7)。返回区间视图 (iid, snap)。"""
+    assert client.post(
+        "/cargo",
+        json={
+            "cargo_id": cargo,
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "temp_upper_limit": "4.0",
+            "initial_holder": "A",
+        },
+    ).status_code == 201
+    assert client.post(
+        "/trips", json={"trip_id": "TQ", "vehicle_no": "v"}
+    ).status_code == 201
+    assert client.post(
+        "/trips/TQ/manifest",
+        json={
+            "items": [{
+                "cargo_id": cargo,
+                "loaded_at": "2026-01-01T09:00:00+00:00",
+                "unloaded_at": "2026-01-01T18:00:00+00:00",
+            }]
+        },
+    ).status_code == 201
+    # 故障时段 [10:00, 12:00) 先于读数登记（晚到读数也即时隔离）
+    assert client.post(
+        "/trips/TQ/probe-faults",
+        json={
+            "fault_id": "pf-1",
+            "fault_start": "2026-01-01T10:00:00+00:00",
+            "fault_end": "2026-01-01T12:00:00+00:00",
+            "reason": "探头失准",
+        },
+    ).status_code == 201
+    assert client.post(
+        "/events",
+        json={"event_id": "m0", "cargo_id": cargo,
+              "occurred_at": "2026-01-01T10:30:00+00:00", "temperature": "8"},
+    ).status_code == 201
+    assert client.post(
+        "/vehicle-readings",
+        json={"reading_id": "vr1", "trip_id": "TQ",
+              "read_at": "2026-01-01T11:00:00+00:00", "temperature": "9"},
+    ).status_code == 201
+    assert client.post(
+        "/vehicle-readings",
+        json={"reading_id": "vr3", "trip_id": "TQ",
+              "read_at": "2026-01-01T11:15:00+00:00", "temperature": "9"},
+    ).status_code == 201
+    assert client.post(
+        "/events",
+        json={"event_id": "m3", "cargo_id": cargo,
+              "occurred_at": "2026-01-01T11:15:00+00:00", "temperature": "7"},
+    ).status_code == 201
+    assert client.post(
+        "/events",
+        json={"event_id": "h1", "cargo_id": cargo,
+              "occurred_at": "2026-01-01T11:30:00+00:00",
+              "giver": "A", "receiver": "B"},
+    ).status_code == 201
+    assert client.post(
+        "/vehicle-readings",
+        json={"reading_id": "vr2", "trip_id": "TQ",
+              "read_at": "2026-01-01T12:30:00+00:00", "temperature": "2"},
+    ).status_code == 201
+    iv = client.get(f"/cargo/{cargo}/responsibilities").json()["intervals"][0]
+    return iv["interval_id"], iv["snapshot_id"]
+
+
+def test_seal_captures_quarantined_readings_with_isolation_basis(client):
+    iid, snap = _setup_quarantined_seal_scenario(client)
+    r = seal(client, "CASE-Q1", "CQ", iid, snap)
+    vrs = {x["reading_id"]: x for x in r.json()["content"]["vehicle_readings"]}
+    # 修复点：被隔离读数不再被归集漏掉（区间内 + 当前装卸窗口内适用）
+    assert set(vrs) == {"vr1", "vr2", "vr3"}
+
+    vr1 = vrs["vr1"]
+    assert vr1["temperature"] == "9.000"
+    assert vr1["effective_temperature"] == "9.000"
+    assert vr1["version"] == 0
+    assert vr1["adopted"] is False
+    assert vr1["quarantined"] is True
+    assert vr1["covering_fault_ids"] == ["pf-1"]
+
+    # 同刻自有测温仍优先：被隔离且被同刻自有取代，仍随包留痕
+    vr3 = vrs["vr3"]
+    assert vr3["adopted"] is False
+    assert vr3["quarantined"] is True
+    assert vr3["covering_fault_ids"] == ["pf-1"]
+
+    # 未隔离读数照常采用
+    assert vrs["vr2"]["adopted"] is True
+    assert vrs["vr2"]["quarantined"] is False
+    assert vrs["vr2"]["covering_fault_ids"] == []
+
+    # 装卸窗口仍在包内（隔离依据的一部分）
+    windows = r.json()["content"]["loading_windows"]
+    assert [w["trip_id"] for w in windows] == ["TQ"]
+
+    # GET 恒返回原内容与摘要（含隔离字段）
+    got = client.get("/evidence-seals/CASE-Q1").json()
+    assert got == r.json()
+    assert got["content_digest"] == r.json()["content_digest"]
+
+    # 无变化时对照为 unchanged、无证据项变更
+    d = client.get("/evidence-seals/CASE-Q1/diff").json()
+    assert d["status"] == "unchanged"
+    assert d["evidence_changes"]["vehicle_readings"] == []
+
+
+def test_sealed_quarantined_reading_covering_set_changes_shown_in_diff(client):
+    iid, snap = _setup_quarantined_seal_scenario(client)
+    created = seal(client, "CASE-Q2", "CQ", iid, snap).json()
+
+    # 重叠故障 pf-2 同样覆盖 11:00 / 11:15：覆盖集合变化 -> changed
+    assert client.post(
+        "/trips/TQ/probe-faults",
+        json={
+            "fault_id": "pf-2",
+            "fault_start": "2026-01-01T10:30:00+00:00",
+            "fault_end": "2026-01-01T11:30:00+00:00",
+            "reason": "重叠失准",
+        },
+    ).status_code == 201
+    d = client.get("/evidence-seals/CASE-Q2/diff").json()
+    assert d["status"] == "unchanged"  # 区间边界 / 片段未变
+    changes = {x["key"]: x for x in d["evidence_changes"]["vehicle_readings"]}
+    assert changes["vr1"]["change"] == "changed"
+    assert changes["vr1"]["fields"] == ["covering_fault_ids"]
+    assert changes["vr1"]["sealed"]["covering_fault_ids"] == ["pf-1"]
+    assert changes["vr1"]["current"]["covering_fault_ids"] == ["pf-1", "pf-2"]
+
+    # 撤销 pf-1：vr1 / vr3 仍被 pf-2 覆盖 -> 仍隔离（继续 changed）
+    assert client.post(
+        "/trips/TQ/probe-faults/revoke",
+        json={"revocation_id": "rv-1", "fault_id": "pf-1",
+              "expected_version": 0},
+    ).status_code == 201
+    d = client.get("/evidence-seals/CASE-Q2/diff").json()
+    assert d["status"] == "unchanged"
+    changes = {x["key"]: x for x in d["evidence_changes"]["vehicle_readings"]}
+    assert changes["vr1"]["change"] == "changed"
+    assert changes["vr1"]["current"]["quarantined"] is True
+    assert changes["vr1"]["current"]["covering_fault_ids"] == ["pf-2"]
+    assert changes["vr1"]["current"]["adopted"] is False
+
+    # 原包始终不变
+    got = client.get("/evidence-seals/CASE-Q2").json()
+    assert got["content"] == created["content"]
+    assert got["content_digest"] == created["content_digest"]
+
+
+def test_sealed_quarantined_reading_restored_when_last_fault_revoked(client):
+    iid, snap = _setup_quarantined_seal_scenario(client)
+    seal(client, "CASE-Q3", "CQ", iid, snap)
+
+    # 撤销最后一条覆盖故障 -> vr1 恢复采用；vr3 同刻自有测温仍优先
+    assert client.post(
+        "/trips/TQ/probe-faults/revoke",
+        json={"revocation_id": "rv-1", "fault_id": "pf-1",
+              "expected_version": 0},
+    ).status_code == 201
+    d = client.get("/evidence-seals/CASE-Q3/diff").json()
+    assert d["status"] == "unchanged"  # vr1=9 本就超限，恢复后区间边界不变
+    changes = {x["key"]: x for x in d["evidence_changes"]["vehicle_readings"]}
+    v1 = changes["vr1"]
+    assert v1["change"] == "changed"
+    assert v1["sealed"]["quarantined"] is True
+    assert v1["current"]["quarantined"] is False
+    assert v1["current"]["covering_fault_ids"] == []
+    assert v1["current"]["adopted"] is True
+    assert set(v1["fields"]) == {
+        "adopted", "quarantined", "covering_fault_ids"
+    }
+    v3 = changes["vr3"]
+    assert v3["change"] == "changed"
+    assert v3["current"]["quarantined"] is False
+    assert v3["current"]["adopted"] is False  # 同刻自有测温仍优先
+
+
+def test_sealed_quarantined_reading_with_correction_restores_effective(client):
+    """隔离期间读数被测温更正：撤销最后一条覆盖故障后按当前有效温度恢复，
+    区间按有效值重建（vr1=3 不超限，成为首个闭合点，区间提前闭合）。"""
+    iid, snap = _setup_quarantined_seal_scenario(client)
+    seal(client, "CASE-Q4", "CQ", iid, snap)
+    # 隔离期间把 vr1 更正为 3（不超限）；仍隔离，区间边界不变
+    r = client.post(
+        "/corrections",
+        json={
+            "correction_id": "vc1",
+            "target_type": "vehicle_reading",
+            "target_id": "vr1",
+            "expected_version": 0,
+            "new_temperature": "3",
+        },
+    )
+    assert r.status_code == 201, r.text
+    d = client.get("/evidence-seals/CASE-Q4/diff").json()
+    changes = {x["key"]: x for x in d["evidence_changes"]["vehicle_readings"]}
+    v1 = changes["vr1"]
+    assert v1["change"] == "changed"
+    assert v1["fields"] == ["effective_temperature", "version"]
+    assert v1["current"]["quarantined"] is True  # 仍隔离
+
+    # 撤销故障：按当前有效温度 3.000 恢复采用 -> vr1 成为首个不超限点，
+    # 区间由 m0 开启后提前于 11:00 闭合（快照变化）
+    assert client.post(
+        "/trips/TQ/probe-faults/revoke",
+        json={"revocation_id": "rv-1", "fault_id": "pf-1",
+              "expected_version": 0},
+    ).status_code == 201
+    d = client.get("/evidence-seals/CASE-Q4/diff").json()
+    assert d["status"] == "changed"
+    assert d["current_interval"]["end"] == "2026-01-01T11:00:00Z"
+    v1 = next(
+        x for x in d["evidence_changes"]["vehicle_readings"]
+        if x["key"] == "vr1"
+    )
+    assert v1["change"] == "changed"
+    assert v1["current"]["effective_temperature"] == "3.000"
+    assert v1["current"]["version"] == 1
+    assert v1["current"]["quarantined"] is False
+    assert v1["current"]["adopted"] is True
+    # 封存原文不被更正 / 撤销改写
+    got = client.get("/evidence-seals/CASE-Q4").json()
+    old = next(
+        x for x in got["content"]["vehicle_readings"]
+        if x["reading_id"] == "vr1"
+    )
+    assert old["effective_temperature"] == "9.000" and old["version"] == 0
+    assert old["quarantined"] is True
+
+
+def test_vehicle_reading_diff_legacy_package_without_quarantine_fields():
+    """旧封存包读数项无 quarantined / covering_fault_ids 键：
+    更正后字段差异不得凭空多出隔离字段；封存后才隔离仍记 removed。"""
+    from app.sealing import _vehicle_reading_diff
+
+    sealed = [{
+        "reading_id": "vr1", "trip_id": "T1", "read_at": "2026-01-01T11:00:00Z",
+        "temperature": "8.000", "effective_temperature": "8.000",
+        "version": 0, "adopted": True,
+    }]
+    corrected = [dict(sealed[0], effective_temperature="5.000", version=1,
+                      quarantined=False, covering_fault_ids=[])]
+    d = _vehicle_reading_diff(sealed, corrected)
+    assert len(d) == 1 and d[0]["change"] == "changed"
+    assert d[0]["fields"] == ["effective_temperature", "version"]
+    # 输出的封存侧仍是原始旧项（不补键）
+    assert "quarantined" not in d[0]["sealed"]
+
+    # 封存后才被故障隔离（旧包无隔离键，当前 quarantined=true）-> removed
+    quarantined = [dict(sealed[0], adopted=False, quarantined=True,
+                        covering_fault_ids=["pf-1"])]
+    d = _vehicle_reading_diff(sealed, quarantined)
+    assert len(d) == 1 and d[0]["change"] == "removed"
+    assert d[0]["current"] is None
+
+    # 完全无变化（当前项带新键、旧项不带）-> 无差异
+    current_plain = [dict(sealed[0], quarantined=False, covering_fault_ids=[])]
+    assert _vehicle_reading_diff(sealed, current_plain) == []

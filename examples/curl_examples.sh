@@ -814,3 +814,104 @@ curl -sS -o /dev/null -w '    stale -> %{http_code}\n' -X POST "$BASE/trips/$FT/
 }"
 curl -sS "$BASE/trips/$FT/probe-faults" \
   | python3 -c 'import json,sys; print("    故障列表 =", [(f["fault_id"], f["active"], f["version"], (f["revocation"] or {}).get("revocation_id")) for f in json.load(sys.stdin)["faults"]])'
+
+# ============================================================
+# 责任证据封存 × 探头故障：故障先登记，封存保留隔离依据，对照反映覆盖集合变化
+# ============================================================
+SQ="COLD-SEAL-Q-1"; ST="TRUCK-SEAL-Q-1"
+
+echo "70) 封存时已登记探头故障：隔离读数仍随包封存（隔离依据可核对）"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$SQ\",
+  \"started_at\": \"2026-10-05T00:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' \
+  -d "{ \"trip_id\": \"$ST\", \"vehicle_no\": \"京B-封Q\" }" >/dev/null
+curl -sS -X POST "$BASE/trips/$ST/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{
+    \"cargo_id\": \"$SQ\",
+    \"loaded_at\": \"2026-10-05T08:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-05T20:00:00+08:00\"
+  }]
+}" >/dev/null
+# 故障 [09:00, 12:30) 先登记（覆盖区间内 10:30 的越温读数）
+curl -sS -X POST "$BASE/trips/$ST/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-sq-1\",
+  \"fault_start\": \"2026-10-05T09:00:00+08:00\",
+  \"fault_end\": \"2026-10-05T12:30:00+08:00\",
+  \"reason\": \"封存前已证实失准\"
+}" >/dev/null
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"sq-m-open\", \"cargo_id\": \"$SQ\",
+  \"occurred_at\": \"2026-10-05T10:00:00+08:00\", \"temperature\": \"8.0\"
+}" >/dev/null
+# 10:30 车载读数越温但落在故障时段（隔离，不参与重建；仍随包封存）
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"sq-vr-q\", \"trip_id\": \"$ST\",
+  \"read_at\": \"2026-10-05T10:30:00+08:00\", \"temperature\": \"9.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"sq-vr-ok\", \"trip_id\": \"$ST\",
+  \"read_at\": \"2026-10-05T13:00:00+08:00\", \"temperature\": \"2.0\"
+}" >/dev/null
+SQ_IID=$(curl -sS "$BASE/cargo/$SQ/responsibilities" \
+  | python3 -c 'import json,sys; iv=json.load(sys.stdin)["intervals"][0]; print(iv["interval_id"], iv["snapshot_id"])' \
+  | cut -d' ' -f1)
+SQ_SNAP=$(curl -sS "$BASE/cargo/$SQ/responsibilities" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["intervals"][0]["snapshot_id"])')
+echo "    区间标识 = $SQ_IID"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"CASE-SEAL-Q-1\", \"cargo_id\": \"$SQ\",
+  \"interval_id\": \"$SQ_IID\", \"snapshot_id\": \"$SQ_SNAP\"
+}" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print("    content_digest =", d["content_digest"])
+for r in d["content"]["vehicle_readings"]:
+    print("   ", r["reading_id"], "eff/ver =", r["effective_temperature"], r["version"],
+          "adopted =", r["adopted"], "quarantined =", r["quarantined"],
+          "covering =", r["covering_fault_ids"])'
+
+echo "    封存后对照（unchanged，隔离读数无差异）："
+curl -sS "$BASE/evidence-seals/CASE-SEAL-Q-1/diff" \
+  | python3 -c 'import json,sys; print("    status =", json.load(sys.stdin)["status"])'
+
+echo "71) 重叠故障登记 -> 覆盖集合变化（changed / covering_fault_ids）；撤一条仍隔离"
+curl -sS -X POST "$BASE/trips/$ST/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-sq-2\",
+  \"fault_start\": \"2026-10-05T10:15:00+08:00\",
+  \"fault_end\": \"2026-10-05T10:45:00+08:00\",
+  \"reason\": \"重叠故障\"
+}" >/dev/null
+curl -sS "$BASE/evidence-seals/CASE-SEAL-Q-1/diff" | python3 -c '
+import json,sys
+x = next(r for r in json.load(sys.stdin)["evidence_changes"]["vehicle_readings"]
+         if r["key"] == "sq-vr-q")
+print("    登记重叠故障:", x["change"], x["fields"], "当前覆盖 =", x["current"]["covering_fault_ids"])'
+curl -sS -X POST "$BASE/trips/$ST/probe-faults/revoke" -H 'Content-Type: application/json' -d "{
+  \"revocation_id\": \"rv-sq-1\", \"fault_id\": \"pf-sq-1\", \"expected_version\": 0
+}" >/dev/null
+curl -sS "$BASE/evidence-seals/CASE-SEAL-Q-1/diff" | python3 -c '
+import json,sys
+x = next(r for r in json.load(sys.stdin)["evidence_changes"]["vehicle_readings"]
+         if r["key"] == "sq-vr-q")
+print("    撤销 pf-sq-1 后: quarantined =", x["current"]["quarantined"],
+      "覆盖 =", x["current"]["covering_fault_ids"], "（重叠故障撤销一条仍隔离）")'
+
+echo "72) 撤销最后一条覆盖故障 -> 读数按当前有效温度恢复；封存原文不变"
+curl -sS -X POST "$BASE/trips/$ST/probe-faults/revoke" -H 'Content-Type: application/json' -d "{
+  \"revocation_id\": \"rv-sq-2\", \"fault_id\": \"pf-sq-2\", \"expected_version\": 0
+}" | python3 -c 'import json,sys; print("    恢复读数 =", json.load(sys.stdin)["restored_reading_ids"])'
+curl -sS "$BASE/evidence-seals/CASE-SEAL-Q-1/diff" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+x = next(r for r in d["evidence_changes"]["vehicle_readings"] if r["key"] == "sq-vr-q")
+print("    区间状态 =", d["status"], "；sq-vr-q:", x["change"], x["fields"],
+      "adopted/quarantined =", x["current"]["adopted"], x["current"]["quarantined"])'
+curl -sS "$BASE/evidence-seals/CASE-SEAL-Q-1" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+r = next(x for x in d["content"]["vehicle_readings"] if x["reading_id"] == "sq-vr-q")
+print("    原包不改: quarantined =", r["quarantined"], "covering =", r["covering_fault_ids"])'
