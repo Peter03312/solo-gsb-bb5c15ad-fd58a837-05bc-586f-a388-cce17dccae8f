@@ -11,8 +11,11 @@
 * 重建该区间所用的**自有事件**（发生时刻不晚于区间闭合时刻的全部事件，
   测温附当前有效温度与更正版本）；
 * **车载读数**：对该货物适用（同一车次且读数时刻在当前装卸窗口内，
-  左闭右开）且读数时刻落在区间内的读数，附当前有效温度、更正版本与
-  封存时是否被同刻自有测温取代（``adopted``）；
+  左闭右开）且读数时刻落在区间内的**全部**读数，附当前有效温度、更正
+  版本、封存时是否被采用（``adopted``）以及封存时是否被生效探头故障
+  隔离（``quarantined``）与覆盖故障编号（``covering_fault_ids``）——
+  被同刻自有测温取代与被故障隔离的原始读数同样随包封存（隔离读数不
+  参与越温重建，``adopted=false``），调查人员可据此核对隔离依据；
 * **当前装卸窗口及版本**：与区间时间范围相交的该货物全部装卸窗口
   （``window_version``，当前窗口时间即其当前版本）。
 
@@ -39,6 +42,18 @@
 对照按封存时相同的证据范围逐项比较，列出**证据项**（自有事件 / 车载读数
 / 装卸窗口）与**责任片段**的新增 / 删除 / 变更；晚到记录与测温 / 装卸
 更正只影响对照结果，**绝不改写封存原包**。
+
+探头故障隔离与对照
+------------------
+* 封存时把区间内适用的**全部**车载读数随包保存（含被生效故障隔离的读数
+  及其覆盖故障编号）；封存后**才被隔离**的读数不参与重建，在对照中记为
+  ``removed``（既有语义保持）；
+* 封存时**已隔离**的读数随包留存，其后续状态在对照中持续跟踪：重叠故障
+  撤销一条后覆盖集合收缩（``covering_fault_ids`` 变更）、撤销最后一条
+  覆盖故障后读数恢复采用（``quarantined`` / ``adopted`` 变更），均在对照
+  中记为 ``changed``；
+* 旧格式封存包（车载读数无隔离字段）按 ``quarantined=false`` /
+  ``covering_fault_ids=[]`` 缺省值参与对照，不产生伪变更。
 """
 from __future__ import annotations
 
@@ -130,8 +145,9 @@ def _own_event_item(e, event_effective: dict) -> dict:
     }
 
 
-def _reading_item(r, reading_effective: dict, adopted: bool) -> dict:
+def _reading_item(r, reading_effective: dict, adopted: bool, covering=()) -> dict:
     eff = reading_effective.get(r.reading_id)
+    covers = sorted(covering)
     return {
         "reading_id": r.reading_id,
         "trip_id": r.trip_id,
@@ -142,6 +158,8 @@ def _reading_item(r, reading_effective: dict, adopted: bool) -> dict:
         ),
         "version": eff[1] if eff is not None else 0,
         "adopted": adopted,
+        "quarantined": bool(covers),
+        "covering_fault_ids": covers,
     }
 
 
@@ -165,6 +183,7 @@ def scoped_evidence(
     span_end,
     apply_window_filter: bool = True,
     reading_quarantine: dict | None = None,
+    keep_quarantined: frozenset | None = None,
 ):
     """按时间范围归集重建证据（封存与现况对照共用同一定义）。
 
@@ -176,8 +195,14 @@ def scoped_evidence(
         自有事件均取“不晚于闭合时刻”的**全部**事件（含开启前完整保管链，
         下界置 False）；车载读数 / 装卸窗口恒按下界与上界归集。
     :param reading_quarantine: 车载读数ID -> 覆盖该读数的**生效探头故障**
-        编号元组；被覆盖的读数不参与越温重建，故不计入重建证据（封存现况
-        对照中表现为该读数 ``removed``，封存原包不被改写）。
+        编号元组。被覆盖的读数不参与越温重建（``adopted=false``），但其
+        原始读数、有效温度 / 版本与隔离状态（``quarantined`` /
+        ``covering_fault_ids``）仍计入证据项。
+    :param keep_quarantined: 对照专用——封存时已被隔离的读数ID集合。
+        为 None（封存）时区间内适用的被隔离读数**全部**计入证据项；
+        为集合（对照）时当前被隔离的读数仅当其封存时已被隔离（在集合内）
+        才计入当前证据，以便跟踪其覆盖集合 / 隔离状态变化；**封存后才被
+        隔离**的读数不计入当前证据，在对照中记为 ``removed``（既有语义）。
     :returns: ``(own_event_items, reading_items, loading_items)`` 规范化字典，
         分别按 事件ID / (读数时刻, 读数ID) / (车次, 原装车时刻) 升序。
     """
@@ -205,9 +230,11 @@ def scoped_evidence(
     }
 
     # 车载读数：对该货物适用（同车次 + 当前窗口左闭右开在车）且读数时刻
-    # 落在范围内；被同刻自有测温取代的原始读数同样封存（adopted=false），
-    # 以完整保留“同刻自有优先”的重建上下文。**被生效探头故障覆盖的读数不
-    # 参与重建**，不计入证据项（封存后登记故障时于对照接口表现为 removed）。
+    # 落在范围内；被同刻自有测温取代（adopted=false）与**被生效探头故障
+    # 隔离**（quarantined=true，附覆盖故障编号）的原始读数同样计入证据，
+    # 以完整保留“同刻自有优先”与故障隔离的重建上下文。被隔离读数不参与
+    # 越温重建（adopted=false）；对照时封存后才被隔离的读数不计入当前
+    # 证据（表现为 removed），封存时已隔离的读数持续跟踪其状态变化。
     reading_items = []
     for r in readings:
         read_at = ensure_utc(r.read_at)
@@ -215,13 +242,19 @@ def scoped_evidence(
             continue
         if span_end is not None and read_at > span_end:
             continue
-        if r.reading_id in reading_quarantine:
+        covers = tuple(reading_quarantine.get(r.reading_id, ()))
+        if (
+            covers
+            and keep_quarantined is not None
+            and r.reading_id not in keep_quarantined
+        ):
             continue
         applicable = any(timeline.is_reading_applicable(l, r) for l in loadings)
         if not applicable:
             continue
+        adopted = read_at not in own_measure_at and not covers
         reading_items.append(
-            _reading_item(r, reading_effective, read_at not in own_measure_at)
+            _reading_item(r, reading_effective, adopted, covers)
         )
     reading_items.sort(key=lambda x: (x["read_at"], x["reading_id"]))
 
@@ -304,7 +337,8 @@ def build_seal_payload(
         （提供当时各责任方最新有效表态）。
     :param sealed_at: 封存时刻（datetime，统一转 UTC 秒级）。
     :param reading_quarantine: 车载读数ID -> 生效探头故障编号元组；
-        被覆盖的读数不参与重建，不计入封存证据。
+        被覆盖的读数不参与重建（``adopted=false``），但其原始读数随包
+        封存并标明 ``quarantined`` / ``covering_fault_ids``。
     """
     start, end = ensure_utc(ex.start), ensure_utc(ex.end)
     # 封存自有事件取“不晚于闭合时刻”的全部事件（含开启前完整保管链，
@@ -431,8 +465,28 @@ def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
 # ----------------------------------------------------------- 现况对照
 
 
-def _evidence_diff(sealed_items: list[dict], current_items: list[dict], key: str):
-    """按键归集的证据项逐项比对：added / removed / changed（含变更字段）。"""
+def _evidence_diff(
+    sealed_items: list[dict],
+    current_items: list[dict],
+    key: str,
+    defaults: dict | None = None,
+):
+    """按键归集的证据项逐项比对：added / removed / changed（含变更字段）。
+
+    :param defaults: 旧格式封存项缺少的新增字段缺省值（如车载读数的
+        ``quarantined`` / ``covering_fault_ids``）——比对前按缺省值补齐，
+        使旧格式封存包不因新增字段产生伪变更；输出的 ``sealed`` /
+        ``current`` 仍为各自原文。
+    """
+    defaults = defaults or {}
+
+    def _norm(item):
+        if item is None or not defaults:
+            return item
+        merged = dict(defaults)
+        merged.update(item)
+        return merged
+
     sealed_map = {item[key]: item for item in sealed_items}
     current_map = {item[key]: item for item in current_items}
     diffs = []
@@ -443,17 +497,21 @@ def _evidence_diff(sealed_items: list[dict], current_items: list[dict], key: str
             diffs.append({"key": k, "change": ITEM_ADDED, "sealed": None, "current": new})
         elif new is None:
             diffs.append({"key": k, "change": ITEM_REMOVED, "sealed": old, "current": None})
-        elif old != new:
-            changed_fields = sorted({f for f in old if old.get(f) != new.get(f)})
-            diffs.append(
-                {
-                    "key": k,
-                    "change": ITEM_CHANGED,
-                    "fields": changed_fields,
-                    "sealed": old,
-                    "current": new,
-                }
-            )
+        else:
+            old_n, new_n = _norm(old), _norm(new)
+            if old_n != new_n:
+                changed_fields = sorted(
+                    {f for f in old_n if old_n.get(f) != new_n.get(f)}
+                )
+                diffs.append(
+                    {
+                        "key": k,
+                        "change": ITEM_CHANGED,
+                        "fields": changed_fields,
+                        "sealed": old,
+                        "current": new,
+                    }
+                )
     return diffs
 
 
@@ -482,12 +540,14 @@ def _segment_diff(sealed_segments: list[list], current_segments: list[list] | No
     return diffs
 
 
-def _current_evidence(state: CurrentState, start_bound, span_end):
+def _current_evidence(state: CurrentState, start_bound, span_end, keep_quarantined):
     """按封存相同的范围定义归集当前证据。
 
     自有事件与封存一致：不施下界（不晚于上界的全部事件——含开启前保管链），
-    ``start_bound`` 只约束车载读数与装卸窗口。被生效探头故障覆盖的读数不
-    参与重建，不计入当前证据（对照中记为 removed）。
+    ``start_bound`` 只约束车载读数与装卸窗口。当前被生效探头故障覆盖的
+    读数不参与重建：仅当其**封存时已被隔离**（在 ``keep_quarantined``
+    集合内）才计入当前证据以跟踪其覆盖集合 / 隔离状态变化；封存后才被
+    隔离的读数不计入，在对照中记为 removed（既有语义保持）。
     """
     return scoped_evidence(
         state.events,
@@ -498,6 +558,7 @@ def _current_evidence(state: CurrentState, start_bound, span_end):
         span_end,
         apply_window_filter=False,
         reading_quarantine=state.quarantine,
+        keep_quarantined=keep_quarantined,
     )
 
 
@@ -511,12 +572,20 @@ def build_diff(content: dict, state: CurrentState, now_ub) -> dict:
     """
     sealed_interval = content["interval"]
     sealed_segments = sealed_interval["segments"]
+    # 封存时已被隔离的车载读数（旧格式封存包无隔离字段，按未隔离处理）：
+    # 这些读数在对照中持续跟踪其隔离状态 / 覆盖集合变化；其余当前被隔离
+    # 的读数（封存后才隔离）不计入当前证据，对照中记为 removed。
+    sealed_quarantined = frozenset(
+        item["reading_id"]
+        for item in content.get("vehicle_readings", [])
+        if item.get("quarantined")
+    )
 
     if state.status == STATUS_UNCHANGED:
         ex = state.current_ex
         cur_start, cur_end = ensure_utc(ex.start), ensure_utc(ex.end)
         own_now, read_now, load_now = _current_evidence(
-            state, cur_start, cur_end
+            state, cur_start, cur_end, sealed_quarantined
         )
         current_interval = _interval_dict(ex)
         current_segments = current_interval["segments"]
@@ -529,7 +598,7 @@ def build_diff(content: dict, state: CurrentState, now_ub) -> dict:
         ex = state.open_ex
         cur_start = ensure_utc(ex.start)
         own_now, read_now, load_now = _current_evidence(
-            state, cur_start, now_ub
+            state, cur_start, now_ub, sealed_quarantined
         )
         current_interval = _open_interval_dict(ex)
         current_segments = current_interval["segments"]
@@ -539,7 +608,7 @@ def build_diff(content: dict, state: CurrentState, now_ub) -> dict:
         # 可能把适用读数带到封存起点之前），上界不限——晚到记录 / 测温更正 /
         # 窗口更正都可能是区间消失的原因，需逐项列出。
         own_now, read_now, load_now = _current_evidence(
-            state, state.cargo_start, None
+            state, state.cargo_start, None, sealed_quarantined
         )
         current_interval = None
         current_segments = None
@@ -561,7 +630,11 @@ def build_diff(content: dict, state: CurrentState, now_ub) -> dict:
                 content["own_events"], own_now, "event_id"
             ),
             "vehicle_readings": _evidence_diff(
-                content["vehicle_readings"], read_now, "reading_id"
+                content["vehicle_readings"],
+                read_now,
+                "reading_id",
+                # 旧格式封存包的车载读数无隔离字段：按未隔离缺省值比对
+                defaults={"quarantined": False, "covering_fault_ids": []},
             ),
             "loading_windows": _loading_window_diff(
                 content["loading_windows"], load_now

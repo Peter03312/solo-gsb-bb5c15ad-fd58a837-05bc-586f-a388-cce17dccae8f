@@ -462,6 +462,103 @@ def test_concurrent_probe_fault_and_reading_write_serialize(client):
     assert client.get("/cargo/CPF/report").json()["excursions"] == []
 
 
+def test_concurrent_seal_and_fault_registration_serialize(client):
+    """封存与探头故障登记按现有锁序（货物行锁）串行：
+
+    故障覆盖区间内的车载读数 vr-q（区间由自有测温开闭，快照不因隔离改变）。
+    并发登记同一故障（一笔 201、其余幂等 200）与多笔封存：无论交叠顺序，
+    每个封存包都必须对应一个一致视图——要么看到故障生效前（vr-q 未隔离、
+    adopted=true），要么看到故障生效后（vr-q 随包封存且 quarantined=true、
+    附覆盖故障编号）；对照结果与各自封存视图自洽（前者记 removed，后者无
+    车载读数变更）。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CFS",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    assert client.post(
+        "/trips", json={"trip_id": "TFS", "vehicle_no": "V"}
+    ).status_code == 201
+    assert client.post(
+        "/trips/TFS/manifest",
+        json={"items": [{
+            "cargo_id": "CFS",
+            "loaded_at": "2026-01-01T10:00:00+00:00",
+            "unloaded_at": "2026-01-01T12:00:00+00:00",
+        }]},
+    ).status_code == 201
+    client.post("/events", json={
+        "event_id": "m1", "cargo_id": "CFS",
+        "occurred_at": "2026-01-01T10:10:00+00:00", "temperature": "8"})
+    client.post("/vehicle-readings", json={
+        "reading_id": "vr-q", "trip_id": "TFS",
+        "read_at": "2026-01-01T10:20:00+00:00", "temperature": "9"})
+    client.post("/events", json={
+        "event_id": "m2", "cargo_id": "CFS",
+        "occurred_at": "2026-01-01T10:50:00+00:00", "temperature": "4"})
+    iv = client.get("/cargo/CFS/responsibilities").json()["intervals"][0]
+    snap = iv["snapshot_id"]
+
+    fault_body = {
+        "fault_id": "pf-conc",
+        "fault_start": "2026-01-01T10:15:00+00:00",
+        "fault_end": "2026-01-01T10:30:00+00:00",
+        "reason": "并发同一故障",
+    }
+
+    def submit_fault(_):
+        return client.post("/trips/TFS/probe-faults", json=fault_body).status_code
+
+    def submit_seal(i):
+        return client.post(
+            "/evidence-seals",
+            json={
+                "case_id": f"CASE-FS-{i}",
+                "cargo_id": "CFS",
+                "interval_id": "m1",
+                "snapshot_id": snap,
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        f_faults = [pool.submit(submit_fault, i) for i in range(4)]
+        f_seals = [pool.submit(submit_seal, i) for i in range(4)]
+        fault_codes = [f.result() for f in f_faults]
+        seal_codes = [f.result() for f in f_seals]
+
+    assert fault_codes.count(201) == 1
+    assert fault_codes.count(200) == 3
+    # 快照不因隔离改变：封存全部成功，且各自对应一个一致视图
+    assert seal_codes.count(201) == 4
+
+    for i in range(4):
+        got = client.get(f"/evidence-seals/CASE-FS-{i}").json()
+        vrq = next(
+            x for x in got["content"]["vehicle_readings"]
+            if x["reading_id"] == "vr-q"
+        )
+        d = client.get(f"/evidence-seals/CASE-FS-{i}/diff").json()
+        assert d["status"] == "unchanged"
+        veh_changes = d["evidence_changes"]["vehicle_readings"]
+        if vrq["quarantined"]:
+            # 故障生效后的一致视图：覆盖故障编号随包封存，对照无车载变更
+            assert vrq["covering_fault_ids"] == ["pf-conc"]
+            assert vrq["adopted"] is False
+            assert veh_changes == []
+        else:
+            # 故障生效前的一致视图：封存后才隔离 -> 对照记为 removed
+            assert vrq["covering_fault_ids"] == []
+            assert vrq["adopted"] is True
+            assert len(veh_changes) == 1
+            assert veh_changes[0]["key"] == "vr-q"
+            assert veh_changes[0]["change"] == "removed"
+
+
 def test_concurrent_seal_and_event_write_serialize(client):
     """封存与同货物的事件写入共用货物行锁：
 

@@ -814,3 +814,94 @@ curl -sS -o /dev/null -w '    stale -> %{http_code}\n' -X POST "$BASE/trips/$FT/
 }"
 curl -sS "$BASE/trips/$FT/probe-faults" \
   | python3 -c 'import json,sys; print("    故障列表 =", [(f["fault_id"], f["active"], f["version"], (f["revocation"] or {}).get("revocation_id")) for f in json.load(sys.stdin)["faults"]])'
+
+# ============================================================
+# 封存 × 探头故障（本轮修复）：故障生效时封存，被隔离读数随包保留并可核对
+# ============================================================
+QC="SEAL-FAULT-CARGO-1"; QT="SEAL-FAULT-TRUCK-1"
+
+echo "70) 封存×故障场景：货物 4℃ 上限 + 装卸窗口；09:00 自有超限开启区间，"
+echo "    09:10 / 09:20 车载读数被故障隔离，09:40 自有不超限闭合"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$QC\",
+  \"started_at\": \"2026-10-04T08:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+  \"trip_id\": \"$QT\", \"vehicle_no\": \"京B-封故1\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips/$QT/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{
+    \"cargo_id\": \"$QC\",
+    \"loaded_at\": \"2026-10-04T08:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-04T20:00:00+08:00\"
+  }]
+}" >/dev/null
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"qseal-m1\", \"cargo_id\": \"$QC\",
+  \"occurred_at\": \"2026-10-04T09:00:00+08:00\", \"temperature\": \"8.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"qvr-1\", \"trip_id\": \"$QT\",
+  \"read_at\": \"2026-10-04T09:10:00+08:00\", \"temperature\": \"9.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"qvr-2\", \"trip_id\": \"$QT\",
+  \"read_at\": \"2026-10-04T09:20:00+08:00\", \"temperature\": \"9.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"qseal-m2\", \"cargo_id\": \"$QC\",
+  \"occurred_at\": \"2026-10-04T09:40:00+08:00\", \"temperature\": \"2.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips/$QT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"qpf-1\",
+  \"fault_start\": \"2026-10-04T09:05:00+08:00\",
+  \"fault_end\": \"2026-10-04T09:25:00+08:00\",
+  \"reason\": \"探头校准漂移（计量院证实）\"
+}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    故障生效，隔离读数 =", d["quarantined_reading_ids"])'
+
+echo "71) 故障生效中封存：区间内被隔离读数随包保留，标明隔离状态 / 覆盖故障 / 是否采用"
+read -r QIID QSNAP < <(python3 - "$BASE" "$QC" <<'PY'
+import json, sys, urllib.request
+base, cargo = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(f"{base}/cargo/{cargo}/responsibilities") as r:
+    iv = json.load(r)["intervals"][0]
+print(iv["interval_id"], iv["snapshot_id"])
+PY
+)
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"CASE-SEAL-FAULT-1\", \"cargo_id\": \"$QC\",
+  \"interval_id\": \"$QIID\", \"snapshot_id\": \"$QSNAP\"
+}" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("    digest =", d["content_digest"])
+for r in d["content"]["vehicle_readings"]:
+    print("   ", r["reading_id"], "adopted =", r["adopted"],
+          "quarantined =", r["quarantined"], "covering =", r["covering_fault_ids"],
+          "有效值/版本 =", r["effective_temperature"], r["version"])'
+
+echo "72) 对照现况（封存后无变化 -> unchanged，被隔离读数无伪变更）"
+curl -sS "$BASE/evidence-seals/CASE-SEAL-FAULT-1/diff" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    status =", d["status"], "读数变更 =", d["evidence_changes"]["vehicle_readings"])'
+
+echo "73) 撤销故障：被隔离读数恢复采用 -> 对照记 changed（quarantined/adopted/覆盖集合）"
+curl -sS -X POST "$BASE/trips/$QT/probe-faults/revoke" -H 'Content-Type: application/json' -d "{
+  \"revocation_id\": \"qrv-1\", \"fault_id\": \"qpf-1\", \"expected_version\": 0
+}" >/dev/null
+curl -sS "$BASE/evidence-seals/CASE-SEAL-FAULT-1/diff" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("    status =", d["status"])
+for x in d["evidence_changes"]["vehicle_readings"]:
+    print("   ", x["key"], x["change"], "变更字段 =", x["fields"],
+          "当前 =", {k: x["current"][k] for k in ("adopted","quarantined","covering_fault_ids")})'
+
+echo "74) 原包不可改：查询仍返回封存时的隔离状态与摘要"
+curl -sS "$BASE/evidence-seals/CASE-SEAL-FAULT-1" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("    digest =", d["content_digest"])
+for r in d["content"]["vehicle_readings"]:
+    print("   ", r["reading_id"], "quarantined =", r["quarantined"], "covering =", r["covering_fault_ids"])'

@@ -765,6 +765,62 @@ def main() -> None:
         show("故障登记列表（含撤销留痕）",
              api.get(f"/trips/{ft}/probe-faults"))
 
+        # ----- 封存 × 探头故障（本轮修复）：故障生效中封存，被隔离读数随包保留 -----
+        print("\n########## 封存 × 探头故障：被隔离读数随包保留并可核对 ##########")
+        qc, qt = "COLD-SEAL-FAULT-PY", "TRUCK-SEAL-FAULT-PY"
+        api.post("/cargo", json={
+            "cargo_id": qc, "started_at": "2026-10-04T08:00:00+08:00",
+            "temp_upper_limit": "4.0", "initial_holder": "北京冷库"})
+        api.post("/trips", json={"trip_id": qt, "vehicle_no": "京B-封故P"})
+        api.post(f"/trips/{qt}/manifest", json={"items": [{
+            "cargo_id": qc,
+            "loaded_at": "2026-10-04T08:00:00+08:00",
+            "unloaded_at": "2026-10-04T20:00:00+08:00"}]})
+        # 09:00 自有超限开启区间；09:10 / 09:20 车载读数将被故障隔离；
+        # 09:40 自有不超限闭合（区间由自有测温开闭，故障不改变快照）
+        api.post("/events", json={
+            "event_id": "qseal-py-m1", "cargo_id": qc,
+            "occurred_at": "2026-10-04T09:00:00+08:00", "temperature": "8.0"})
+        api.post("/vehicle-readings", json={
+            "reading_id": "qvr-py-1", "trip_id": qt,
+            "read_at": "2026-10-04T09:10:00+08:00", "temperature": "9.0"})
+        api.post("/vehicle-readings", json={
+            "reading_id": "qvr-py-2", "trip_id": qt,
+            "read_at": "2026-10-04T09:20:00+08:00", "temperature": "9.0"})
+        api.post("/events", json={
+            "event_id": "qseal-py-m2", "cargo_id": qc,
+            "occurred_at": "2026-10-04T09:40:00+08:00", "temperature": "2.0"})
+        api.post(f"/trips/{qt}/probe-faults", json={
+            "fault_id": "qpf-py-1",
+            "fault_start": "2026-10-04T09:05:00+08:00",
+            "fault_end": "2026-10-04T09:25:00+08:00",
+            "reason": "探头校准漂移（计量院证实）"})
+
+        qiv = api.get(f"/cargo/{qc}/responsibilities").json()["intervals"][0]
+        qseal = api.post("/evidence-seals", json={
+            "case_id": "CASE-SEAL-FAULT-PY-1",
+            "cargo_id": qc,
+            "interval_id": qiv["interval_id"],
+            "snapshot_id": qiv["snapshot_id"],
+        }).json()
+        print("故障生效中封存：")
+        for r in qseal["content"]["vehicle_readings"]:
+            print("   ", r["reading_id"], "adopted =", r["adopted"],
+                  "quarantined =", r["quarantined"],
+                  "covering =", r["covering_fault_ids"])
+        show("对照现况（unchanged，被隔离读数无伪变更）",
+             api.get("/evidence-seals/CASE-SEAL-FAULT-PY-1/diff"))
+
+        api.post(f"/trips/{qt}/probe-faults/revoke", json={
+            "revocation_id": "qrv-py-1", "fault_id": "qpf-py-1",
+            "expected_version": 0})
+        show("撤销故障后对照（被隔离读数恢复采用 -> changed）",
+             api.get("/evidence-seals/CASE-SEAL-FAULT-PY-1/diff"))
+        restored = api.get("/evidence-seals/CASE-SEAL-FAULT-PY-1").json()
+        print("原包不可改（仍为封存时隔离状态）：",
+              [(r["reading_id"], r["quarantined"], r["covering_fault_ids"])
+               for r in restored["content"]["vehicle_readings"]])
+
 
 if __name__ == "__main__":
     main()
